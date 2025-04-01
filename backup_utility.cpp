@@ -58,7 +58,7 @@ private:
             if (fullBackup) {
                 // Полное копирование
                 std::string s = getFullBackup();
-                if (s.length() != 0) return 0;
+                if (s != "") return 0;
                 std::string newBackupDir = backupDir + "\\full_backup_" + timestamp;
                 fs::create_directories(newBackupDir);
                 for (const auto& entry : fs::recursive_directory_iterator(sourceDir)) {
@@ -123,8 +123,7 @@ private:
         }
     
         // Если папка не найдена, возвращаем пустой путь
-        std::cerr << "Папка, начинающаяся с 'full_', не найдена в директории " << backupDir << std::endl;
-        std::string s = {};
+        std::string s = "";
         return s;
     }
 

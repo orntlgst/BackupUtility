@@ -1,4 +1,5 @@
 #include <windows.h>
+#include <tlhelp32.h>
 #include <iostream>
 #include <fstream>
 #include <vector>
@@ -7,9 +8,9 @@
 #include <fcntl.h>
 #include <sstream>
 #include <string>
+#include <tchar.h>
 
 //добавить восстановление данных (мердж фулл и ласт бэкап в сорсдир)
-//добавить HANDLE в класс (свойство, конструктор, сер и десер), проверку на running process (GetExitCodeProcess, в него inst.handle)
 
 using namespace std;
 
@@ -21,7 +22,6 @@ class UtilInstance {
         string sourcePath;
         string backupPath;
         size_t maxCopies;
-        HANDLE pHandle;
         
     public:
         // Конструктор для инициализации свойств
@@ -222,12 +222,135 @@ int removeUtilInstance(size_t i)
     return 0;
 }
 
-int recoverData(size_t index)
+string FindLatestBackupDirectory(const std::string& directoryPath)
 {
-    //по индексу получаем изначальную дир и дир бэкапов
-    //в дир бэкапов находим фулл и посл дифф
-    //объединяем фулл и посл дифф в темп дир
-    //заменяем содержимое изначальной дир на темп дир, темп дир удаляем
+    string latestBackup = "";
+    FILETIME latestTime = {0, 0};
+
+    for (const auto& entry : fs::directory_iterator(directoryPath))
+    {
+        if (entry.is_directory())
+        {
+            string folderName = entry.path().filename().string();
+            
+            // Проверяем, начинается ли имя папки с "backup"
+            if (folderName.rfind("backup", 0) == 0)
+            {
+                // Получаем handle к каталогу для получения времени создания
+                HANDLE hFile = CreateFile(
+                    entry.path().string().c_str(),
+                    GENERIC_READ,
+                    FILE_SHARE_READ,
+                    NULL,
+                    OPEN_EXISTING,
+                    FILE_FLAG_BACKUP_SEMANTICS,
+                    NULL);
+
+                if (hFile != INVALID_HANDLE_VALUE)
+                {
+                    FILETIME creationTime;
+                    if (GetFileTime(hFile, &creationTime, NULL, NULL))
+                    {
+                        // Сравниваем время создания
+                        if (CompareFileTime(&creationTime, &latestTime) > 0)
+                        {
+                            latestTime = creationTime;
+                            latestBackup = entry.path().string();
+                        }
+                    }
+                    CloseHandle(hFile);
+                }
+            }
+        }
+    }
+
+    return latestBackup;
+}
+
+void mergeDirectories(const string& sourceDir, const string& targetDir)
+{
+    // Создаем целевую директорию, если её нет
+    fs::create_directories(targetDir);
+
+    for (const auto& entry : fs::directory_iterator(sourceDir))
+    {
+        const auto targetPath = fs::path(targetDir) / entry.path().filename();
+
+        if (entry.is_directory())
+        {
+            // Рекурсивно обрабатываем подкаталоги
+            mergeDirectories(entry.path().string(), targetPath.string());
+        }
+        else if (entry.is_regular_file())
+        {
+            bool shouldCopy = true;
+
+            // Проверяем, существует ли файл в целевой директории
+            if (fs::exists(targetPath))
+            {
+                // Получаем время последнего изменения для обоих файлов
+                auto sourceTime = fs::last_write_time(entry);
+                auto targetTime = fs::last_write_time(targetPath);
+
+                // Копируем только если исходный файл новее
+                shouldCopy = (sourceTime > targetTime);
+            }
+
+            if (shouldCopy)
+            {
+                try {
+                    fs::copy(entry.path(), targetPath, fs::copy_options::overwrite_existing);
+                }
+                catch (const fs::filesystem_error& e) {
+                    // Обработка ошибок копирования
+                    continue;
+                }
+            }
+        }
+    }
+}
+
+int recoverData(size_t i)
+{
+    string BackupPath = uList[i].getBackupPath();
+    string SourcePath = uList[i].getSourcePath();
+    string FullBackupName = "", LastBackupName = "";
+
+    for (const auto& entry : fs::directory_iterator(BackupPath)) {
+        if (fs::is_directory(entry)) {
+            // Получаем имя папки
+            std::string folderName = entry.path().filename().string();
+
+            // Проверяем, начинается ли имя папки с "full_"
+            if (folderName.rfind("full_", 0) == 0) { // rfind возвращает 0, если строка начинается с "full_"
+                FullBackupName = entry.path().string(); // Возвращаем путь к папке
+            }
+        }
+    }
+
+    LastBackupName = FindLatestBackupDirectory(BackupPath);
+
+    if (FullBackupName == ""  && LastBackupName == "") 
+    {
+        cout << "Error: No copies found!" << endl;
+        return 0;
+    }
+
+    if (FullBackupName == "")
+        mergeDirectories(LastBackupName, SourcePath);
+    
+    if (LastBackupName == "")
+        mergeDirectories(FullBackupName, SourcePath);
+    
+    if (FullBackupName != "" && LastBackupName != "")
+    {
+        mergeDirectories(FullBackupName, SourcePath + "\\Temp");
+        mergeDirectories(LastBackupName, SourcePath + "\\Temp");
+        mergeDirectories(SourcePath + "\\Temp", SourcePath);
+        fs::remove_all(SourcePath + "\\Temp"); // Deletes one or more files recursively.
+        fs::remove(SourcePath + "\\Temp"); // Deletes empty directories or single files.
+
+    }
     return 0;
 }
 
@@ -357,12 +480,58 @@ void mainMenu ()
     }
 }
 
+
+void TerminateBackupUtilityProcesses()
+{
+    HANDLE hProcessSnap = NULL;
+    PROCESSENTRY32 pe32 = { 0 };
+
+    // Создаем снимок всех процессов в системе
+    hProcessSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (hProcessSnap == INVALID_HANDLE_VALUE)
+    {
+        _tprintf(_T("Error: can't snap process list\n"));
+        return;
+    }
+
+    // Устанавливаем размер структуры перед использованием
+    pe32.dwSize = sizeof(PROCESSENTRY32);
+
+    // Получаем информацию о первом процессе
+    if (!Process32First(hProcessSnap, &pe32))
+    {
+        _tprintf(_T("Error: can't get process data\n"));
+        CloseHandle(hProcessSnap);
+        return;
+    }
+
+    // Перебираем все процессы
+    do
+    {
+        // Проверяем имя процесса
+        if (lstrcmpi(pe32.szExeFile, _T("backup_utility.exe")) == 0)
+        {
+            // Открываем процесс для завершения
+            HANDLE hProcess = OpenProcess(PROCESS_TERMINATE, FALSE, pe32.th32ProcessID);
+            if (hProcess != NULL)
+            {
+                // Завершаем процесс
+                TerminateProcess(hProcess, 0);
+                CloseHandle(hProcess);
+            }
+        }
+    } while (Process32Next(hProcessSnap, &pe32));
+
+    // Закрываем handle снимка процессов
+    CloseHandle(hProcessSnap);
+}
+
 int main () {
     const string filelist = "dir_list.bin";
     if (fs::exists(filelist)) 
-    { 
+    {
+        TerminateBackupUtilityProcesses();
         uList = readListFromFile(filelist);
-        // ДОБАВИТЬ ПРОВЕРКУ с HANDLE
         for (size_t i = 0; i < uList.size(); ++i) {
 
             contUtilInst(i, uList[i].getSourcePath(), uList[i].getBackupPath(), uList[i].getMaxCopies());
@@ -371,5 +540,6 @@ int main () {
     }
     mainMenu();
     writeListToFile(uList, filelist);
+
     return 0;
 }
